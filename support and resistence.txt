@@ -1,0 +1,304 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import time
+from datetime import datetime, date
+
+print("RUNNING FINAL SR BOT")
+
+# =========================================
+# CONNECT TO MT5
+# =========================================
+
+path = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+if not mt5.initialize(path=path):
+    print("MT5 connection failed:", mt5.last_error())
+    quit()
+
+print("Connected to MT5")
+
+# =========================================
+# SETTINGS
+# =========================================
+
+symbol = "GOLD.i#"
+
+start_hour = 9
+end_hour = 20
+
+max_daily_loss = 29
+daily_dd_limit = 3
+overall_dd_limit = 6
+
+risk_per_trade = 14
+
+sl_points = 15
+tp_points = 30
+
+breakeven_trigger = 8
+trailing_stop = 10
+
+LEVEL_BUFFER = 5
+
+# =========================================
+# TRACKING
+# =========================================
+
+account = mt5.account_info()
+
+highest_equity_all_time = account.equity
+highest_equity_today = account.equity
+
+today = date.today()
+last_candle_time = None
+
+# =========================================
+# LOT SIZE
+# =========================================
+
+def calculate_lot():
+    value_per_point = 1
+    lot = risk_per_trade / (sl_points * value_per_point)
+    return round(max(0.01, min(lot, 1)), 2)
+
+# =========================================
+# MANAGE TRADES (BE + TRAIL)
+# =========================================
+
+def manage_trades():
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+
+    for pos in positions:
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            price = tick.bid
+            profit = price - pos.price_open
+
+            # Breakeven
+            if profit >= breakeven_trigger and pos.sl < pos.price_open:
+                mt5.order_send({
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "sl": pos.price_open,
+                    "tp": pos.tp
+                })
+                print("BUY BE set")
+
+            # Trailing
+            new_sl = price - trailing_stop
+            if new_sl > pos.sl:
+                mt5.order_send({
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                })
+                print("BUY trailing updated")
+
+        else:
+            price = tick.ask
+            profit = pos.price_open - price
+
+            # Breakeven
+            if profit >= breakeven_trigger and pos.sl > pos.price_open:
+                mt5.order_send({
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "sl": pos.price_open,
+                    "tp": pos.tp
+                })
+                print("SELL BE set")
+
+            # Trailing
+            new_sl = price + trailing_stop
+            if new_sl < pos.sl:
+                mt5.order_send({
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                })
+                print("SELL trailing updated")
+
+# =========================================
+# MAIN LOOP
+# =========================================
+
+while True:
+
+    print("\n===== CHECKING MARKET =====")
+
+    # Reset daily
+    if date.today() != today:
+        today = date.today()
+        highest_equity_today = mt5.account_info().equity
+        print("New day reset")
+
+    # Session filter
+    hour = datetime.now().hour
+    if hour < start_hour or hour > end_hour:
+        print("Outside session")
+        time.sleep(60)
+        continue
+
+    # Account
+    acc = mt5.account_info()
+    equity = acc.equity
+
+    highest_equity_all_time = max(highest_equity_all_time, equity)
+    highest_equity_today = max(highest_equity_today, equity)
+
+    # Risk checks
+    daily_loss = highest_equity_today - equity
+    if daily_loss >= max_daily_loss:
+        print("Daily loss hit")
+        time.sleep(300)
+        continue
+
+    daily_dd = ((highest_equity_today - equity) / highest_equity_today * 100) if highest_equity_today > 0 else 0
+    if daily_dd >= daily_dd_limit:
+        print("Daily DD hit")
+        time.sleep(300)
+        continue
+
+    overall_dd = ((highest_equity_all_time - equity) / highest_equity_all_time * 100) if highest_equity_all_time > 0 else 0
+    if overall_dd >= overall_dd_limit:
+        print("Max DD hit. Stopping.")
+        mt5.shutdown()
+        quit()
+
+    # =====================================
+    # DATA M15
+    # =====================================
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 300)
+    df = pd.DataFrame(rates)
+
+    candle_time = df.iloc[-1]['time']
+    if candle_time == last_candle_time:
+        manage_trades()
+        time.sleep(60)
+        continue
+
+    last_candle_time = candle_time
+    print("New candle")
+
+    # Indicators
+    df['EMA_50'] = df['close'].ewm(span=50).mean()
+    df['EMA_200'] = df['close'].ewm(span=200).mean()
+
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    df['support'] = df['low'].rolling(20).min()
+    df['resistance'] = df['high'].rolling(20).max()
+
+    last = df.iloc[-1]
+
+    price = last['close']
+    support = last['support']
+    resistance = last['resistance']
+
+    near_support = abs(price - support) <= LEVEL_BUFFER
+    near_resistance = abs(price - resistance) <= LEVEL_BUFFER
+
+    print(f"Price: {price}")
+    print(f"Support: {support} | Resistance: {resistance}")
+
+    # =====================================
+    # H1 CONFIRMATION
+    # =====================================
+
+    h1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 300)
+    df_h1 = pd.DataFrame(h1)
+
+    df_h1['EMA_50'] = df_h1['close'].ewm(span=50).mean()
+    df_h1['EMA_200'] = df_h1['close'].ewm(span=200).mean()
+
+    h1_last = df_h1.iloc[-1]
+
+    # =====================================
+    # CHECK POSITIONS
+    # =====================================
+
+    positions = mt5.positions_get(symbol=symbol)
+    buy_exists = any(p.type == 0 for p in positions) if positions else False
+    sell_exists = any(p.type == 1 for p in positions) if positions else False
+
+    lot = calculate_lot()
+
+    # =====================================
+    # BUY
+    # =====================================
+
+    if (
+        last['EMA_50'] > last['EMA_200']
+        and last['RSI'] > 50
+        and h1_last['EMA_50'] > h1_last['EMA_200']
+        and near_support
+    ):
+        print("BUY SIGNAL")
+
+        if not buy_exists:
+            price = mt5.symbol_info_tick(symbol).ask
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": lot,
+                "type": mt5.ORDER_TYPE_BUY,
+                "price": price,
+                "sl": support - 2,
+                "tp": price + tp_points,
+                "deviation": 20,
+                "magic": 202605,
+                "comment": "BUY SR",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            print(mt5.order_send(request))
+
+    # =====================================
+    # SELL
+    # =====================================
+
+    elif (
+        last['EMA_50'] < last['EMA_200']
+        and last['RSI'] < 50
+        and h1_last['EMA_50'] < h1_last['EMA_200']
+        and near_resistance
+    ):
+        print("SELL SIGNAL")
+
+        if not sell_exists:
+            price = mt5.symbol_info_tick(symbol).bid
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": lot,
+                "type": mt5.ORDER_TYPE_SELL,
+                "price": price,
+                "sl": resistance + 2,
+                "tp": price - tp_points,
+                "deviation": 20,
+                "magic": 202605,
+                "comment": "SELL SR",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            print(mt5.order_send(request))
+
+    else:
+        print("NO SIGNAL")
+
+    time.sleep(60)
